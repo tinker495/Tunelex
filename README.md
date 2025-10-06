@@ -29,7 +29,6 @@ This repository explores reimplementing the [`prodigy-plus-schedule-free`](https
 | **3** | prodigy               | None | 64         | 1000            | 14     | 3          | 96.9033 +/- 0.2146  | 0.1511 +/- 0.0118  |
 | **4** | adopt                 | 0.001 | 64         | 1000            | 14     | 3          | 96.8733 +/- 0.5387  | 0.1534 +/- 0.0209  |
 | **5** | adamw                 | 0.001 | 64         | 1000            | 14     | 3          | 96.8133 +/- 0.1401  | 0.1613 +/- 0.0189  |
-| **6** | ano                   | 0.001 | 64         | 1000            | 14     | 1          | 96.4000             | 0.2380             |
 
 Schedule-free Prodigy is the headline result: the zero extra-parameter variant tops the MNIST benchmark and still holds second place on KMNIST, trailing only schedule-free AdamW while matching its simplicity. The schedule-free transform keeps the optimizer competitive without tuning new degrees of freedom.
 
