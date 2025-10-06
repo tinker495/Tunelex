@@ -138,7 +138,7 @@ def scale_by_prodigy_with_schedule_free(
         # Important: recompute x to both save memory and maintain accurate x seq
         # especially if y is modified by another transform wrapped on top.
         prev_x = jax.tree.map(
-            lambda yi, zi: (yi - (1.0 - b1) * zi) / b1, params, state.z
+            lambda yi, zi: (yi - (1.0 - beta1) * zi) / beta1, params, state.z
         )
 
         x = jax.tree.map(
@@ -147,7 +147,7 @@ def scale_by_prodigy_with_schedule_free(
             z,
         )
         new_params = jax.tree.map(
-            lambda xi, zi: b1 * xi + (1.0 - b1) * zi,
+            lambda xi, zi: beta1 * xi + (1.0 - beta1) * zi,
             x,
             z,
         )
