@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
@@ -100,6 +101,73 @@ def collate_batch(batch: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     return {"image": images, "label": labels}
 
 
+def _coerce_estim_lr(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_estim_lr(opt_state: Any) -> float | None:
+    seen: set[int] = set()
+
+    def _search(node: Any) -> float | None:
+        if node is None:
+            return None
+        node_id = id(node)
+        if node_id in seen:
+            return None
+        seen.add(node_id)
+
+        if hasattr(node, "estim_lr"):
+            estim_lr = _coerce_estim_lr(getattr(node, "estim_lr"))
+            if estim_lr is not None:
+                return estim_lr
+
+        if isinstance(node, Mapping):
+            for value in node.values():
+                result = _search(value)
+                if result is not None:
+                    return result
+
+        if isinstance(node, tuple):
+            if hasattr(node, "_fields"):
+                for field in node._fields:
+                    result = _search(getattr(node, field))
+                    if result is not None:
+                        return result
+            for value in node:
+                result = _search(value)
+                if result is not None:
+                    return result
+
+        if isinstance(node, list):
+            for value in node:
+                result = _search(value)
+                if result is not None:
+                    return result
+
+        if hasattr(node, "__dict__"):
+            for value in vars(node).values():
+                result = _search(value)
+                if result is not None:
+                    return result
+
+        if hasattr(node, "_asdict"):
+            for value in node._asdict().values():
+                result = _search(value)
+                if result is not None:
+                    return result
+
+        return None
+
+    return _search(opt_state)
+
+
 @flax.struct.dataclass
 class TrainState:
     step: int
@@ -140,7 +208,7 @@ class TrainState:
 
 
 def _num_groups(channels: int) -> int:
-    max_groups = min(32, channels)
+    max_groups = min(8, channels)
     while max_groups > 1 and channels % max_groups != 0:
         max_groups -= 1
     return max_groups
@@ -273,6 +341,7 @@ def train_epoch(
 
     format_loss = lambda value: f"{float(value):.6f}"  # noqa: E731
     format_acc = lambda value: f"{float(value) * 100:.2f}%"  # noqa: E731
+    format_estim_lr = lambda value: f"{float(value):.6f}"  # noqa: E731
 
     progress = Progress(
         TextColumn("[bold blue]Epoch {task.fields[epoch]}/{task.fields[total_epochs]}[/]"),
@@ -282,6 +351,7 @@ def train_epoch(
         TimeRemainingColumn(),
         TextColumn("Loss: {task.fields[loss]}", justify="right"),
         TextColumn("Acc: {task.fields[acc]}", justify="right"),
+        TextColumn("Est. LR: {task.fields[estim_lr]}", justify="right"),
     )
 
     metrics_table = Table.grid()
@@ -290,6 +360,7 @@ def train_epoch(
     metrics_table.add_row("Epoch", str(epoch))
     metrics_table.add_row("Loss", "-")
     metrics_table.add_row("Accuracy", "-")
+    metrics_table.add_row("Estim LR", "-")
 
     progress_task = progress.add_task(
         "train",
@@ -298,6 +369,7 @@ def train_epoch(
         total_epochs=args.epochs,
         loss="-",
         acc="-",
+        estim_lr="-",
     )
 
     console = Console()
@@ -318,13 +390,17 @@ def train_epoch(
             state, metrics = train_step(state, batch, model)
             loss_str = format_loss(metrics["loss"])
             acc_str = format_acc(metrics["accuracy"])
+            estim_lr_value = _extract_estim_lr(state.opt_state)
+            estim_lr_str = format_estim_lr(estim_lr_value) if estim_lr_value is not None else "-"
             metrics_table.columns[1]._cells[1] = loss_str
             metrics_table.columns[1]._cells[2] = acc_str
+            metrics_table.columns[1]._cells[3] = estim_lr_str
             progress.update(
                 progress_task,
                 advance=1,
                 loss=loss_str,
                 acc=acc_str,
+                estim_lr=estim_lr_str,
             )
             if args.dry_run and step >= 1:
                 break
@@ -357,12 +433,16 @@ def evaluate(
         BarColumn(bar_width=None),
         TaskProgressColumn(),
         TimeElapsedColumn(),
+        TextColumn("Est. LR: {task.fields[estim_lr]}", justify="right"),
     )
     metrics_panel: Panel | None = None
     console = Console()
 
+    estim_lr_value = _extract_estim_lr(state.opt_state)
+    estim_lr_str = f"{estim_lr_value:.6f}" if estim_lr_value is not None else "-"
+
     with Live(console=console, refresh_per_second=8) as live:
-        eval_task = progress.add_task("eval", total=math.ceil(total_examples / batch_size))
+        eval_task = progress.add_task("eval", total=math.ceil(total_examples / batch_size), estim_lr=estim_lr_str)
         live.update(Panel(progress, title="Evaluation", border_style="cyan"))
         for batch in test_loader:
             params_for_eval = state.params
@@ -382,6 +462,8 @@ def evaluate(
     summary_table.add_column("Value", justify="right")
     summary_table.add_row("Average Loss", f"{avg_loss:.4f}")
     summary_table.add_row("Accuracy", f"{total_correct}/{total_examples} ({accuracy:.2f}%)")
+    if estim_lr_value is not None:
+        summary_table.add_row("Estim LR", estim_lr_str)
 
     console = Console()
     console.print(summary_table)
