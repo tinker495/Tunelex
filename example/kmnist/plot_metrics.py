@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import re
+from rich.console import Console
+from rich.table import Table
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("logs/kmnist/kmnist_metrics.png"),
         help="Path to save the generated plot image (PNG)",
+    )
+    parser.add_argument(
+        "--summary-csv",
+        type=Path,
+        default=Path("logs/kmnist/kmnist_last_epoch_summary.csv"),
+        help="Path to save the last-epoch metrics summary (CSV)",
     )
     return parser.parse_args()
 
@@ -77,6 +85,192 @@ def _load_metrics(csv_paths: Iterable[Path]) -> list[pd.DataFrame]:
                 df[numeric_column] = pd.to_numeric(df[numeric_column], errors="coerce").astype(dtype)
         dataframes.append(df)
     return dataframes
+
+
+def _format_value(value: Any) -> str:
+    if pd.isna(value):
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _build_last_epoch_summary(dataframes: list[pd.DataFrame]) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    metadata_candidates = [
+        "run",
+        "optimizer",
+        "lr",
+        "batch_size",
+        "test_batch_size",
+        "epochs",
+        "seed",
+    ]
+
+    for df in dataframes:
+        if df.empty:
+            continue
+        if "epoch" in df.columns:
+            last_row = df.loc[df["epoch"].idxmax()]
+        else:
+            last_row = df.iloc[-1]
+
+        record: dict[str, Any] = {}
+        for column in metadata_candidates:
+            if column in last_row.index:
+                record[column] = last_row[column]
+
+        if "epoch" in last_row.index:
+            record["epoch"] = last_row["epoch"]
+
+        for column in df.columns:
+            if column in record or column in metadata_candidates:
+                continue
+            if pd.api.types.is_numeric_dtype(df[column]):
+                record[column] = last_row[column]
+
+        if record:
+            records.append(record)
+
+    raw_df = pd.DataFrame.from_records(records)
+    if raw_df.empty:
+        return raw_df
+
+    numeric_columns = [
+        column
+        for column in raw_df.columns
+        if pd.api.types.is_numeric_dtype(raw_df[column]) and column not in {"seed"}
+    ]
+
+    metadata_columns = [
+        column
+        for column in raw_df.columns
+        if column not in numeric_columns
+    ]
+
+    group_priority = [
+        "optimizer",
+        "lr",
+        "batch_size",
+        "test_batch_size",
+        "epochs",
+    ]
+    group_columns = [col for col in group_priority if col in metadata_columns]
+
+    additional_metadata = [
+        col
+        for col in metadata_columns
+        if col not in {"run", "seed"} and col not in group_columns
+    ]
+    group_columns.extend(additional_metadata)
+
+    temp_group_col = "__group__"
+    if not group_columns:
+        raw_df[temp_group_col] = 0
+        group_columns = [temp_group_col]
+
+    agg_dict: dict[str, list[str]] = {
+        column: ["mean", "std"]
+        for column in numeric_columns
+        if column not in {"seed"}
+    }
+
+    grouped = raw_df.groupby(group_columns, dropna=False)
+    summary_df = grouped.agg(agg_dict)
+    if isinstance(summary_df.columns, pd.MultiIndex):
+        summary_df.columns = [f"{col}_{stat}" for col, stat in summary_df.columns]
+    summary_df = summary_df.reset_index()
+
+    if temp_group_col in summary_df.columns:
+        summary_df = summary_df.drop(columns=temp_group_col)
+
+    if "seed" in raw_df.columns and any(col not in {"seed"} for col in metadata_columns):
+        summary_df["seed_count"] = grouped["seed"].nunique().values
+    elif "seed" in raw_df.columns:
+        summary_df["seed_count"] = len(raw_df["seed"].unique())
+
+    ordered_metadata = [
+        col
+        for col in group_priority + additional_metadata
+        if col in summary_df.columns
+    ]
+    if "seed_count" in summary_df.columns:
+        ordered_metadata.append("seed_count")
+
+    metric_columns = [
+        col
+        for col in summary_df.columns
+        if col not in ordered_metadata and col not in {"seed", "run"}
+    ]
+    key_metric_order = []
+    for base in ("avg_loss", "accuracy"):
+        for suffix in ("_mean", "_std"):
+            name = f"{base}{suffix}"
+            if name in metric_columns:
+                key_metric_order.append(name)
+    remaining_metrics = [col for col in metric_columns if col not in key_metric_order]
+    ordered_columns = ordered_metadata + key_metric_order + sorted(remaining_metrics)
+    summary_df = summary_df[ordered_columns]
+
+    sort_candidates = [
+        col for col in ("optimizer", "lr", "batch_size", "test_batch_size", "epochs")
+        if col in summary_df.columns
+    ]
+    if sort_candidates:
+        summary_df = summary_df.sort_values(by=sort_candidates).reset_index(drop=True)
+    return summary_df
+
+
+def _print_rich_summary(summary_df: pd.DataFrame) -> None:
+    console = Console()
+    if summary_df.empty:
+        console.print("[bold yellow]No last-epoch metrics to summarize.[/bold yellow]")
+        return
+
+    metric_bases = sorted({col[:-5] for col in summary_df.columns if col.endswith("_mean")})
+    std_columns = {col[:-4] for col in summary_df.columns if col.endswith("_std")}
+
+    metadata_columns = [
+        col
+        for col in summary_df.columns
+        if not (col.endswith("_mean") or col.endswith("_std"))
+    ]
+
+    table = Table(title="Last Epoch Metrics Summary")
+    for column in metadata_columns:
+        justify = "right" if pd.api.types.is_numeric_dtype(summary_df[column]) else "left"
+        table.add_column(column, justify=justify)
+
+    for base in metric_bases:
+        label = f"{base} (+/-)"
+        table.add_column(label, justify="right")
+
+    for _, row in summary_df.iterrows():
+        cells: list[str] = []
+        for column in metadata_columns:
+            cells.append(_format_value(row[column]))
+
+        for base in metric_bases:
+            mean_value = row.get(f"{base}_mean")
+            std_value = row.get(f"{base}_std") if base in std_columns else None
+            if pd.isna(mean_value):
+                cells.append("-")
+            else:
+                mean_formatted = _format_value(mean_value)
+                if std_value is None or pd.isna(std_value):
+                    cells.append(mean_formatted)
+                else:
+                    std_formatted = _format_value(std_value)
+                    cells.append(f"{mean_formatted} +/- {std_formatted}")
+
+        table.add_row(*cells)
+
+    console.print(table)
+
+
+def _write_summary_csv(summary_df: pd.DataFrame, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(output_path, index=False)
 
 
 def plot_metrics(dataframes: list[pd.DataFrame], output_path: Path) -> None:
@@ -191,6 +385,10 @@ def main() -> None:
     if not dfs:
         raise ValueError("No non-empty KMNIST metrics files found to plot.")
     plot_metrics(dfs, args.output)
+    summary_df = _build_last_epoch_summary(dfs)
+    _print_rich_summary(summary_df)
+    if not summary_df.empty:
+        _write_summary_csv(summary_df, args.summary_csv)
 
 
 if __name__ == "__main__":
