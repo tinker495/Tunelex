@@ -139,24 +139,83 @@ class TrainState:
         )
 
 
-class CNN(nn.Module):
+def _num_groups(channels: int) -> int:
+    max_groups = min(32, channels)
+    while max_groups > 1 and channels % max_groups != 0:
+        max_groups -= 1
+    return max_groups
+
+
+class ResidualBlock(nn.Module):
+    features: int
+    strides: tuple[int, int] = (1, 1)
+
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool) -> jnp.ndarray:
-        x = nn.Conv(features=32, kernel_size=(3, 3), strides=(1, 1))(x)
+        residual = x
+
+        y = nn.Conv(
+            features=self.features,
+            kernel_size=(3, 3),
+            strides=self.strides,
+            padding="SAME",
+            use_bias=False,
+        )(x)
+        y = nn.GroupNorm(num_groups=_num_groups(self.features), epsilon=1e-5)(y)
+        y = nn.relu(y)
+
+        y = nn.Conv(
+            features=self.features,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME",
+            use_bias=False,
+        )(y)
+        y = nn.GroupNorm(num_groups=_num_groups(self.features), epsilon=1e-5)(y)
+
+        if residual.shape != y.shape:
+            residual = nn.Conv(
+                features=self.features,
+                kernel_size=(1, 1),
+                strides=self.strides,
+                use_bias=False,
+            )(residual)
+            residual = nn.GroupNorm(num_groups=_num_groups(self.features), epsilon=1e-5)(residual)
+
+        return nn.relu(y + residual)
+
+
+class ResNet(nn.Module):
+    num_classes: int = 10
+    base_features: int = 32
+    blocks_per_stage: tuple[int, ...] = (2, 2, 2, 2)
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool) -> jnp.ndarray:
+        features_per_stage = [self.base_features * (2 ** i) for i in range(len(self.blocks_per_stage))]
+
+        x = nn.Conv(
+            features=features_per_stage[0],
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME",
+            use_bias=False,
+        )(x)
+        x = nn.GroupNorm(num_groups=_num_groups(features_per_stage[0]), epsilon=1e-5)(x)
         x = nn.relu(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1))(x)
-        x = nn.relu(x)
-        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
-        x = nn.Dropout(rate=0.25)(x, deterministic=not training)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(features=128)(x)
-        x = nn.relu(x)
+
+        for stage_idx, (stage_features, num_blocks) in enumerate(zip(features_per_stage, self.blocks_per_stage)):
+            for block_idx in range(num_blocks):
+                strides = (2, 2) if stage_idx > 0 and block_idx == 0 else (1, 1)
+                x = ResidualBlock(features=stage_features, strides=strides)(x, training=training)
+
+        x = jnp.mean(x, axis=(1, 2))
         x = nn.Dropout(rate=0.5)(x, deterministic=not training)
-        x = nn.Dense(features=10)(x)
+        x = nn.Dense(features=self.num_classes)(x)
         return x
 
 
-def create_train_state(rng: jax.Array, learning_rate: float, model: CNN, *, optimizer_name: str) -> TrainState:
+def create_train_state(rng: jax.Array, learning_rate: float, model: ResNet, *, optimizer_name: str) -> TrainState:
     params_rng, dropout_rng = jax.random.split(rng)
     dummy_batch = jnp.ones((1, 28, 28, 1), dtype=jnp.float32)
     variables = model.init({"params": params_rng, "dropout": dropout_rng}, dummy_batch, training=True)
@@ -166,7 +225,7 @@ def create_train_state(rng: jax.Array, learning_rate: float, model: CNN, *, opti
 
 
 @partial(jax.jit, static_argnums=2)
-def train_step(state: TrainState, batch: dict[str, np.ndarray], model: CNN) -> tuple[TrainState, dict[str, jnp.ndarray]]:
+def train_step(state: TrainState, batch: dict[str, np.ndarray], model: ResNet) -> tuple[TrainState, dict[str, jnp.ndarray]]:
     images = jnp.asarray(batch["image"], dtype=jnp.float32)
     labels = jnp.asarray(batch["label"], dtype=jnp.int32)
     dropout_rng, new_dropout_rng = jax.random.split(state.dropout_rng)
@@ -184,7 +243,7 @@ def train_step(state: TrainState, batch: dict[str, np.ndarray], model: CNN) -> t
 
 
 @partial(jax.jit, static_argnums=2)
-def eval_step(params: Any, batch: dict[str, np.ndarray], model: CNN) -> tuple[jnp.ndarray, jnp.ndarray]:
+def eval_step(params: Any, batch: dict[str, np.ndarray], model: ResNet) -> tuple[jnp.ndarray, jnp.ndarray]:
     images = jnp.asarray(batch["image"], dtype=jnp.float32)
     labels = jnp.asarray(batch["label"], dtype=jnp.int32)
     logits = model.apply({"params": params}, images, training=False)
@@ -199,7 +258,7 @@ def train_epoch(
     train_labels: np.ndarray,
     epoch: int,
     args: argparse.Namespace,
-    model: CNN,
+    model: ResNet,
 ) -> TrainState:
     train_dataset = ArrayDataset(train_images, train_labels)
     train_loader = DataLoader(
@@ -276,7 +335,7 @@ def evaluate(
     state: TrainState,
     test_images: np.ndarray,
     test_labels: np.ndarray,
-    model: CNN,
+    model: ResNet,
     *,
     batch_size: int,
     optimizer_name: str,
@@ -380,7 +439,7 @@ def main() -> None:
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
 
-    model = CNN()
+    model = ResNet()
     state = create_train_state(rng, args.lr, model, optimizer_name=args.optimizer)
 
     train_images, train_labels, test_images, test_labels = load_kmnist_splits(data_dir)

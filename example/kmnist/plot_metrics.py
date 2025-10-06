@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import matplotlib
 matplotlib.use("Agg")
@@ -63,11 +63,18 @@ def _parse_run_metadata(stem: str) -> dict[str, str]:
 def _load_metrics(csv_paths: Iterable[Path]) -> list[pd.DataFrame]:
     dataframes: list[pd.DataFrame] = []
     for csv_path in csv_paths:
-        df = pd.read_csv(csv_path)
-        if df.empty:
+        df_raw = pd.read_csv(csv_path)
+        if df_raw.empty:
             continue
+        df = df_raw.copy()
         df["run"] = csv_path.stem
-        df.attrs["metadata"] = _parse_run_metadata(csv_path.stem)
+        metadata = _parse_run_metadata(csv_path.stem)
+        df.attrs["metadata"] = metadata
+        for key, value in metadata.items():
+            df[key] = value
+        for numeric_column, dtype in (("epoch", int), ("avg_loss", float), ("accuracy", float)):
+            if numeric_column in df.columns:
+                df[numeric_column] = pd.to_numeric(df[numeric_column], errors="coerce").astype(dtype)
         dataframes.append(df)
     return dataframes
 
@@ -76,27 +83,86 @@ def plot_metrics(dataframes: list[pd.DataFrame], output_path: Path) -> None:
     sns.set_theme(style="whitegrid")
     fig, (ax_loss, ax_acc) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
-    metadata_list = [df.attrs.get("metadata", {}) for df in dataframes]
-    value_sets: dict[str, set[str]] = {}
-    for meta in metadata_list:
-        for key, value in meta.items():
-            value_sets.setdefault(key, set()).add(value)
-    varying_keys = {key for key, values in value_sets.items() if len(values) > 1}
+    if not dataframes:
+        raise ValueError("No metrics dataframes provided for plotting.")
 
-    def format_label(meta: dict[str, str]) -> str:
-        if not varying_keys:
-            return meta.get("optimizer", meta.get("run", "run"))
-        if len(varying_keys) == 1:
-            key = next(iter(varying_keys))
-            return meta.get(key, meta.get("run", "run"))
-        pairs = [f"{key}={meta.get(key, '?')}" for key in sorted(varying_keys)]
-        return ", ".join(pairs)
+    combined = pd.concat(dataframes, ignore_index=True)
 
+    metadata_keys: set[str] = set()
     for df in dataframes:
-        meta = df.attrs.get("metadata", {})
-        display_label = format_label(meta)
-        sns.lineplot(data=df, x="epoch", y="avg_loss", marker="o", ax=ax_loss, label=display_label)
-        sns.lineplot(data=df, x="epoch", y="accuracy", marker="o", ax=ax_acc, label=display_label)
+        metadata_keys.update(df.attrs.get("metadata", {}).keys())
+
+    metadata_keys = {key for key in metadata_keys if key in combined.columns}
+    varying_keys = [key for key in metadata_keys if combined[key].nunique(dropna=False) > 1]
+    other_keys = [key for key in sorted(varying_keys) if key != "seed"]
+
+    if "seed" in combined.columns:
+        combined["seed"] = combined["seed"].astype(str)
+
+    if other_keys:
+        group_columns = other_keys
+    elif "optimizer" in combined.columns:
+        group_columns = ["optimizer"]
+    else:
+        group_columns = []
+
+    groupby_columns = group_columns + ["epoch"]
+
+    agg_df = (
+        combined.groupby(groupby_columns, dropna=False)
+        .agg(
+            avg_loss_mean=("avg_loss", "mean"),
+            avg_loss_min=("avg_loss", "min"),
+            avg_loss_max=("avg_loss", "max"),
+            accuracy_mean=("accuracy", "mean"),
+            accuracy_min=("accuracy", "min"),
+            accuracy_max=("accuracy", "max"),
+        )
+        .reset_index()
+    )
+
+    if not group_columns:
+        agg_df["__label__"] = "metrics"
+    else:
+        agg_df["__label__"] = agg_df.apply(
+            lambda row: ", ".join(f"{col}={row[col]}" for col in group_columns), axis=1
+        )
+
+    labels = list(agg_df["__label__"].unique())
+    palette = sns.color_palette(n_colors=max(len(labels), 1))
+    color_map = {label: palette[idx % len(palette)] for idx, label in enumerate(labels)}
+
+    for label, group in agg_df.groupby("__label__"):
+        color = color_map[label]
+        group_sorted = group.sort_values("epoch")
+        ax_loss.plot(
+            group_sorted["epoch"],
+            group_sorted["avg_loss_mean"],
+            label=label,
+            color=color,
+            linewidth=2,
+        )
+        ax_loss.fill_between(
+            group_sorted["epoch"],
+            group_sorted["avg_loss_min"],
+            group_sorted["avg_loss_max"],
+            color=color,
+            alpha=0.2,
+        )
+
+        ax_acc.plot(
+            group_sorted["epoch"],
+            group_sorted["accuracy_mean"],
+            color=color,
+            linewidth=2,
+        )
+        ax_acc.fill_between(
+            group_sorted["epoch"],
+            group_sorted["accuracy_min"],
+            group_sorted["accuracy_max"],
+            color=color,
+            alpha=0.2,
+        )
 
     ax_loss.set_title("Average Loss per Epoch")
     ax_loss.set_ylabel("Loss")
@@ -105,8 +171,12 @@ def plot_metrics(dataframes: list[pd.DataFrame], output_path: Path) -> None:
     ax_acc.set_ylabel("Accuracy (%)")
     ax_acc.set_xlabel("Epoch")
 
-    handles, labels = ax_acc.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3)
+    handles, legend_labels = ax_loss.get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, legend_labels, loc="upper center", ncol=min(len(legend_labels), 3))
+        legend = ax_loss.get_legend()
+        if legend is not None:
+            legend.remove()
     plt.tight_layout(rect=[0, 0, 1, 0.95])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

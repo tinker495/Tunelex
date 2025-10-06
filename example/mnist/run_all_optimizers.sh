@@ -11,6 +11,8 @@ pushd "$PROJECT_ROOT" >/dev/null
 LOGS_DIR="$PROJECT_ROOT/logs/mnist"
 mkdir -p "$LOGS_DIR"
 
+SEEDS=${SEEDS:-"1 2 3"}
+
 OPTIMIZERS=$(MNIST_DIR="$MNIST_DIR" python - <<'PY'
 import importlib.util
 import os
@@ -24,9 +26,11 @@ print(" ".join(module.optimizer_names()))
 PY
 )
 
-for OPT in $OPTIMIZERS; do
-    echo "Running optimizer: $OPT"
-    python "$MNIST_DIR/main.py" --optimizer "$OPT"
+for SEED in $SEEDS; do
+    for OPT in $OPTIMIZERS; do
+        echo "Running optimizer: $OPT (seed $SEED)"
+        python "$MNIST_DIR/main.py" --optimizer "$OPT" --seed "$SEED"
+    done
 done
 
 PLOT_OUTPUT="$LOGS_DIR/all_optimizers.png"
