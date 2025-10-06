@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "optax-tunelex"
 version = "0.1.0"
-description = "Tuneless optimizer experiments for Optax and JAX."
+description = "Tuneless optimizer for Optax and JAX."
 readme = "README.md"
 requires-python = ">=3.9"
 license = {file = "LICENSE"}
