@@ -6,13 +6,16 @@ from typing import Callable, Dict
 
 import optax
 
+from optax.tunelex.optimizer import schedule_free_prodigy
 OptimizerFactory = Callable[[float], optax.GradientTransformation]
 
 
 _OPTIMIZERS: Dict[str, OptimizerFactory] = {
     "adamw": lambda lr: optax.adamw(learning_rate=lr),
+    "adopt": lambda lr: optax.contrib.adopt(learning_rate=lr),
     "prodigy": lambda lr: optax.contrib.prodigy(),
     "schedule_free_adamw": lambda lr: optax.contrib.schedule_free_adamw(learning_rate=lr),
+    "schedule_free_prodigy": lambda lr: schedule_free_prodigy(),
     # "schedule_free_sgd": lambda lr: optax.contrib.schedule_free_sgd(learning_rate=lr), # don't measure sgd
     # "sgd": lambda lr: optax.sgd(learning_rate=lr),
     # "momentum": lambda lr: optax.sgd(learning_rate=lr, momentum=0.9),

@@ -32,3 +32,4 @@ Issues = "https://github.com/tinker/Tunelex/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["optax.tunelex*"]

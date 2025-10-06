@@ -340,7 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64, metavar="N", help="training batch size")
     parser.add_argument("--test-batch-size", type=int, default=1000, metavar="N", help="test batch size")
     parser.add_argument("--epochs", type=int, default=14, metavar="N", help="number of epochs to train")
-    parser.add_argument("--lr", type=float, default=0.0025, metavar="LR", help="learning rate")
+    parser.add_argument("--lr", type=float, default=0.001, metavar="LR", help="learning rate")
     parser.add_argument(
         "--optimizer",
         type=str,
