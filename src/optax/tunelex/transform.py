@@ -80,78 +80,73 @@ def scale_by_prodigy_with_schedule_free(
             raise ValueError(base.NO_PARAMS_MSG)
         count = state.count
         count_inc = numerics.safe_increment(count)
-        sched = learning_rate(count) if callable(learning_rate) else learning_rate
+        sched = learning_rate(count_inc) if callable(learning_rate) else learning_rate
         estim_lr = state.estim_lr
         params0 = state.params0
         numerator_weighted = state.numerator_weighted
-        grad_sum = state.grad_sum
         b1 = state.b1
-        z = state.z
+        z_old = state.z
 
+        one_minus_beta1 = 1.0 - b1
+        beta1_inv = 1.0 / b1
+        one_minus_beta2 = 1.0 - beta2
         bc = ((1 - beta2**count_inc) ** 0.5) / (1 - beta1**count_inc)
         dlr = jnp.asarray(estim_lr * sched * bc, dtype=estim_lr.dtype)
-        dg = jax.tree.map(lambda g: estim_lr * g, updates)
+        estim_lr_ratio = estim_lr / estim_lr0
+        grad_sum_coeff = estim_lr_ratio if safeguard_warmup else dlr / estim_lr0
+        weight_decay_dlr = weight_decay * dlr
+
         param_diff = jax.tree.map(lambda p0, p: p0 - p, params0, params)
         numerator_acum = optax.tree.vdot(updates, param_diff)
+
+        dg = jax.tree.map(lambda g: estim_lr * g, updates)
         exp_avg_sq = jax.tree.map(
-            lambda eas, dgk: beta2 * eas + (1 - beta2) * dgk * dgk,
+            lambda eas, dgk: beta2 * eas + one_minus_beta2 * dgk * dgk,
             state.exp_avg_sq,
             dg,
         )
-        if safeguard_warmup:
-            grad_sum = jax.tree.map(
-                lambda sk, dgk: beta3 * sk + estim_lr * dgk / estim_lr0, grad_sum, dg
-            )
-        else:
-            grad_sum = jax.tree.map(
-                lambda sk, dgk: beta3 * sk + dlr * dgk / estim_lr0, grad_sum, dg
-            )
+        grad_sum = jax.tree.map(
+            lambda sk, dgk: beta3 * sk + grad_sum_coeff * dgk,
+            state.grad_sum,
+            dg,
+        )
+        abs_grad_sum = jax.tree.map(jnp.abs, grad_sum)
+
         numerator_weighted = beta3 * numerator_weighted
-        numerator_weighted += (estim_lr / estim_lr0) * dlr * numerator_acum
-        denominator = optax.tree.sum(jax.tree.map(jnp.abs, grad_sum))
+        numerator_weighted += estim_lr_ratio * dlr * numerator_acum
+        denominator = optax.tree.sum(abs_grad_sum)
         lr_estimate = estim_lr_coef * numerator_weighted / denominator
         estim_lr = jnp.maximum(state.estim_lr, lr_estimate)
+        estim_lr_eps = estim_lr * eps
 
-        updates_with_decay = jax.tree.map(
-            lambda ea, eas, p: -weight_decay * dlr * p
-            - dlr * ea / (jnp.sqrt(eas) + estim_lr * eps),
-            dg,
-            exp_avg_sq,
+        z = jax.tree.map(
+            lambda zi, pi, eas, dgk: jnp.asarray(
+                zi
+                - weight_decay_dlr * pi
+                - dlr * dgk / (jnp.sqrt(eas) + estim_lr_eps),
+                dtype=jnp.asarray(zi).dtype,
+            ),
+            z_old,
             params,
+            exp_avg_sq,
+            dg,
         )
 
         weight = estim_lr**weight_lr_power
         next_total_weight = state.weight_sum + weight
-        # We add this to avoid NaNs in the case of a small learning rate.
         ck = jnp.where(
             jnp.logical_or(jnp.isnan(weight), jnp.isnan(next_total_weight)),
             jnp.full(weight.shape, jnp.nan),
             jnp.nan_to_num(weight / next_total_weight, nan=0.0, posinf=jnp.inf),
         )
 
-        z = jax.tree.map(
-            lambda pi, ui: jnp.asarray(pi + ui).astype(jnp.asarray(pi).dtype),
-            state.z,
-            updates_with_decay,
-        )
+        def _combined_param_update(pi, zi_prev, zi_new):
+            prev_x = (pi - one_minus_beta1 * zi_prev) * beta1_inv
+            x = (1.0 - ck) * prev_x + ck * zi_new
+            new_param = b1 * x + one_minus_beta1 * zi_new
+            return new_param - pi
 
-        # Important: recompute x to both save memory and maintain accurate x seq
-        # especially if y is modified by another transform wrapped on top.
-        prev_x = jax.tree.map(
-            lambda yi, zi: (yi - (1.0 - beta1) * zi) / beta1, params, state.z
-        )
-
-        x = jax.tree.map(
-            lambda xi, zi: (1.0 - ck) * xi + ck * zi,
-            prev_x,
-            z,
-        )
-        new_params = jax.tree.map(
-            lambda xi, zi: beta1 * xi + (1.0 - beta1) * zi,
-            x,
-            z,
-        )
-        updates = jax.tree.map(lambda npi, pi: npi - pi, new_params, params)
+        updates = jax.tree.map(_combined_param_update, params, z_old, z)
 
         new_state = Prodigy_with_schedule_free_State(
             exp_avg_sq,
