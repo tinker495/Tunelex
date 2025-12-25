@@ -5,7 +5,7 @@ from .transform import scale_by_prodigy_with_schedule_free
 
 def schedule_free_prodigy(
     learning_rate: base.ScalarOrSchedule = 1.0,
-    betas: Tuple[float, float] = (0.9, 0.999),
+    betas: Tuple[float, float] = (0.95, 0.99),
     beta3: Optional[float] = None,
     eps: float = 1e-8,
     estim_lr0: float = 1e-6,
